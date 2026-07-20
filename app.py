@@ -1,29 +1,20 @@
-"""
-Flask deployment app for a pre-trained scikit-learn SVM (SVC) model.
-Designed for deployment on Render (or any WSGI host via gunicorn).
-
-The model expects 9 features, in this order:
-gender, age, study_hours_per_week, attendance_rate, parent_education,
-internet_access, extracurricular, previous_score, final_score
-
-NOTE ON CATEGORICAL ENCODING
------------------------------
-The pickle only stores the fitted SVC estimator, not the encoders used
-on categorical columns during training. The ENCODINGS map below is a
-reasonable default — update it to match your original training
-pipeline exactly if predictions look off.
-"""
-
+import os
 import pickle
-from pathlib import Path
-
+import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, request, jsonify, render_template
 
 app = Flask(__name__)
 
-MODEL_PATH = Path(__file__).parent / "svm_model.pkl"
+# ---------------------------------------------------------------------------
+# Load the trained SVM model once, at startup
+# ---------------------------------------------------------------------------
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "svm_model.pkl")
 
+with open(MODEL_PATH, "rb") as f:
+    model = pickle.load(f)
+
+# Feature order MUST match the order the model was trained on
 FEATURE_ORDER = [
     "gender",
     "age",
@@ -36,8 +27,11 @@ FEATURE_ORDER = [
     "final_score",
 ]
 
+# Encoding maps used to turn friendly form inputs into the numbers the model expects.
+# NOTE: These must match the encoding used when the model was originally trained.
+# Adjust them here if your training pipeline used a different mapping.
 ENCODINGS = {
-    "gender": {"Female": 0, "Male": 1},
+    "gender": {"Male": 0, "Female": 1},
     "internet_access": {"No": 0, "Yes": 1},
     "extracurricular": {"No": 0, "Yes": 1},
     "parent_education": {
@@ -48,49 +42,52 @@ ENCODINGS = {
     },
 }
 
-# Load the model once at startup rather than per-request.
-with open(MODEL_PATH, "rb") as f:
-    MODEL = pickle.load(f)
-
-
-def encode_payload(payload: dict) -> pd.DataFrame:
-    """Turn raw form values into the numeric row the model expects."""
-    row = {}
-    for key in FEATURE_ORDER:
-        value = payload.get(key)
-        if value is None:
-            raise ValueError(f"Missing field: {key}")
-        if key in ENCODINGS:
-            mapping = ENCODINGS[key]
-            if value not in mapping:
-                raise ValueError(f"Invalid value for {key}: {value}")
-            row[key] = mapping[value]
-        else:
-            row[key] = float(value)
-    return pd.DataFrame([row])[FEATURE_ORDER]
-
 
 @app.route("/")
-def index():
-    return render_template("index.html", encodings=ENCODINGS)
+def home():
+    return render_template("index.html")
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
-        payload = request.get_json(force=True)
-        input_df = encode_payload(payload)
-        prediction = MODEL.predict(input_df)[0]
-        return jsonify({"ok": True, "prediction": str(prediction)})
+        data = request.get_json(force=True)
+
+        # Build the feature vector in the correct order
+        row = []
+        for feature in FEATURE_ORDER:
+            value = data.get(feature)
+            if value is None or value == "":
+                return jsonify({"error": f"Missing value for '{feature}'"}), 400
+
+            if feature in ENCODINGS:
+                mapping = ENCODINGS[feature]
+                if value not in mapping:
+                    return jsonify({"error": f"Invalid value '{value}' for '{feature}'"}), 400
+                row.append(mapping[value])
+            else:
+                row.append(float(value))
+
+        X = pd.DataFrame([row], columns=FEATURE_ORDER)
+
+        prediction = model.predict(X)[0]
+
+        # probability=False on this model, so use decision_function as a
+        # confidence proxy instead of predict_proba
+        try:
+            score = float(model.decision_function(X)[0])
+        except Exception:
+            score = None
+
+        return jsonify({
+            "prediction": str(prediction),
+            "decision_score": score
+        })
+
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    # Local dev only — Render runs this via gunicorn (see Procfile).
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
